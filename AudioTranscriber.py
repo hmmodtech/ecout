@@ -1,154 +1,196 @@
-import wave
-import os
-import threading
-import tempfile
-import custom_speech_recognition as sr
-import io
-from datetime import timedelta
-import pyaudiowpatch as pyaudio
-from heapq import merge
+"""
+Transcription scheduler + transcript store.
 
-PHRASE_TIMEOUT = 3.05
-MAX_PHRASES = 10
+Speech *segments* produced by :mod:`audio_engine` are transcribed by a small
+worker pool.  Interviewer (Speaker) finals are served first, interim
+segments are coalesced (only the newest one per phrase is ever decoded), so
+a question is recognised as soon as the interviewer pauses – even while the
+candidate's own audio is still being processed.
+"""
+from __future__ import annotations
+
+import itertools
+import queue
+import threading
+import time
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Optional, Tuple
+
+from audio_engine import Segment
+from TranscriberModels import clean_transcript
+
+MAX_PHRASES = 40  # kept in memory / rendered
+
+
+@dataclass
+class TranscriptEntry:
+    phrase_id: int
+    who: str
+    text: str
+    start_time: float
+    end_time: float
+    is_final: bool
+    seq: int = 0
+    latency_ms: float = 0.0
+
+    def line(self) -> str:
+        suffix = "" if self.is_final else " …"
+        return f"{self.who}: [{self.text}{suffix}]\n\n"
+
 
 class AudioTranscriber:
-    def __init__(self, mic_source, speaker_source, model):
-        self.transcript_data = {"You": [], "Speaker": []}
-        self.transcript_changed_event = threading.Event()
+    def __init__(self, model, config: Optional[dict] = None,
+                 on_update: Optional[Callable[[TranscriptEntry], None]] = None,
+                 workers: int = 2):
         self.audio_model = model
-        self.audio_sources = {
-            "You": {
-                "sample_rate": mic_source.SAMPLE_RATE,
-                "sample_width": mic_source.SAMPLE_WIDTH,
-                "channels": mic_source.channels,
-                "last_sample": bytes(),
-                "last_spoken": None,
-                "new_phrase": True,
-                "process_data_func": self.process_mic_data
-            },
-            "Speaker": {
-                "sample_rate": speaker_source.SAMPLE_RATE,
-                "sample_width": speaker_source.SAMPLE_WIDTH,
-                "channels": speaker_source.channels,
-                "last_sample": bytes(),
-                "last_spoken": None,
-                "new_phrase": True,
-                "process_data_func": self.process_speaker_data
-            }
-        }
+        self.config = config or {}
+        self.on_update = on_update or (lambda entry: None)
+        self.workers = max(1, int(workers))
 
-    def transcribe_audio_queue(self, speaker_queue, mic_queue):
-        import queue
-        
-        while True:
-            pending_transcriptions = []
-            
-            mic_data = []
-            while True:
-                try:
-                    data, time_spoken = mic_queue.get_nowait()
-                    self.update_last_sample_and_phrase_status("You", data, time_spoken)
-                    mic_data.append((data, time_spoken))
-                except queue.Empty:
-                    break
-                    
-            speaker_data = []
-            while True:
-                try:
-                    data, time_spoken = speaker_queue.get_nowait()
-                    self.update_last_sample_and_phrase_status("Speaker", data, time_spoken)
-                    speaker_data.append((data, time_spoken))
-                except queue.Empty:
-                    break
-            
-            if mic_data:
-                source_info = self.audio_sources["You"]
-                try:
-                    fd, path = tempfile.mkstemp(suffix=".wav")
-                    os.close(fd)
-                    source_info["process_data_func"](source_info["last_sample"], path)
-                    text = self.audio_model.get_transcription(path)
-                    if text != '' and text.lower() != 'you':
-                        latest_time = max(time for _, time in mic_data)
-                        pending_transcriptions.append(("You", text, latest_time))
-                except Exception as e:
-                    print(f"Transcription error for You: {e}")
-                finally:
-                    os.unlink(path)
-            
-            if speaker_data:
-                source_info = self.audio_sources["Speaker"]
-                try:
-                    fd, path = tempfile.mkstemp(suffix=".wav")
-                    os.close(fd)
-                    source_info["process_data_func"](source_info["last_sample"], path)
-                    text = self.audio_model.get_transcription(path)
-                    if text != '' and text.lower() != 'you':
-                        latest_time = max(time for _, time in speaker_data)
-                        pending_transcriptions.append(("Speaker", text, latest_time))
-                except Exception as e:
-                    print(f"Transcription error for Speaker: {e}")
-                finally:
-                    os.unlink(path)
-            
-            if pending_transcriptions:
-                pending_transcriptions.sort(key=lambda x: x[2])
-                for who_spoke, text, time_spoken in pending_transcriptions:
-                    self.update_transcript(who_spoke, text, time_spoken)
-                
-                self.transcript_changed_event.set()
-            
-            threading.Event().wait(0.1)
+        self._jobs: "queue.PriorityQueue" = queue.PriorityQueue()
+        self._seq = itertools.count(1)
+        self._latest_seq: Dict[int, int] = {}          # phrase_id → newest submitted seq
+        self._final_seen: set = set()                   # phrase ids that already have a final
+        self._entries: Dict[int, TranscriptEntry] = {}  # phrase_id → entry
+        self._lock = threading.RLock()
+        self._threads: List[threading.Thread] = []
+        self._running = False
+        self.version = 0
+        self.transcript_changed_event = threading.Event()
+        self.stats = {"segments": 0, "decoded": 0, "skipped": 0, "total_latency_ms": 0.0}
 
-    def update_last_sample_and_phrase_status(self, who_spoke, data, time_spoken):
-        source_info = self.audio_sources[who_spoke]
-        if source_info["last_spoken"] and time_spoken - source_info["last_spoken"] > timedelta(seconds=PHRASE_TIMEOUT):
-            source_info["last_sample"] = bytes()
-            source_info["new_phrase"] = True
-        else:
-            source_info["new_phrase"] = False
+    # -- lifecycle ---------------------------------------------------------------
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        for i in range(self.workers):
+            t = threading.Thread(target=self._worker, name=f"asr-worker-{i}", daemon=True)
+            t.start()
+            self._threads.append(t)
 
-        source_info["last_sample"] += data
-        source_info["last_spoken"] = time_spoken 
+    def stop(self):
+        self._running = False
+        for _ in self._threads:
+            self._jobs.put(((9, 9, 0), 0, None))
 
-    def process_mic_data(self, data, temp_file_name):
-        audio_data = sr.AudioData(data, self.audio_sources["You"]["sample_rate"], self.audio_sources["You"]["sample_width"])
-        wav_data = io.BytesIO(audio_data.get_wav_data())
-        with open(temp_file_name, 'w+b') as f:
-            f.write(wav_data.read())
+    # -- input -------------------------------------------------------------------
+    def submit(self, segment: Segment):
+        """Called from the audio thread – must be cheap."""
+        if segment is None or segment.audio is None or len(segment.audio) == 0:
+            return
+        seq = next(self._seq)
+        with self._lock:
+            self._latest_seq[segment.phrase_id] = seq
+            if segment.is_final:
+                self._final_seen.add(segment.phrase_id)
+            self.stats["segments"] += 1
+        priority = (0 if segment.is_final else 1, 0 if segment.source == "Speaker" else 1, seq)
+        self._jobs.put((priority, seq, segment))
 
-    def process_speaker_data(self, data, temp_file_name):
-        with wave.open(temp_file_name, 'wb') as wf:
-            wf.setnchannels(self.audio_sources["Speaker"]["channels"])
-            p = pyaudio.PyAudio()
-            wf.setsampwidth(p.get_sample_size(pyaudio.paInt16))
-            wf.setframerate(self.audio_sources["Speaker"]["sample_rate"])
-            wf.writeframes(data)
+    # -- workers -----------------------------------------------------------------
+    def _worker(self):
+        while self._running:
+            try:
+                _prio, seq, segment = self._jobs.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if segment is None:
+                break
+            try:
+                self._handle(seq, segment)
+            except Exception as exc:  # pragma: no cover - defensive
+                print(f"[ASR] worker error: {exc}")
 
-    def update_transcript(self, who_spoke, text, time_spoken):
-        source_info = self.audio_sources[who_spoke]
-        transcript = self.transcript_data[who_spoke]
+    def _handle(self, seq: int, segment: Segment):
+        with self._lock:
+            newest = self._latest_seq.get(segment.phrase_id, seq)
+            if not segment.is_final and (newest != seq or segment.phrase_id in self._final_seen):
+                self.stats["skipped"] += 1
+                return  # stale interim – a newer decode of this phrase is queued
+        t0 = time.perf_counter()
+        text = self.audio_model.transcribe(segment.audio) or ""
+        latency = (time.perf_counter() - t0) * 1000.0
+        text = clean_transcript(text)
+        with self._lock:
+            self.stats["decoded"] += 1
+            self.stats["total_latency_ms"] += latency
+            existing = self._entries.get(segment.phrase_id)
+            if existing and existing.is_final and not segment.is_final:
+                return  # final already displayed
+            if not text:
+                if existing and not existing.is_final and segment.is_final:
+                    # interim showed something but the final decode is empty → drop it
+                    self._entries.pop(segment.phrase_id, None)
+                    self._bump()
+                return
+            if existing and not segment.is_final and existing.seq > seq:
+                return
+            entry = TranscriptEntry(segment.phrase_id, segment.source, text, segment.start_time,
+                                    segment.end_time, segment.is_final, seq, latency)
+            self._entries[segment.phrase_id] = entry
+            self._trim()
+            self._bump()
+        if self.config.get("asr_debug", False):
+            print(f"[ASR] {segment.source:7s} {'final ' if segment.is_final else 'interim'} "
+                  f"{segment.duration:4.1f}s audio → {latency:5.0f} ms : {text[:80]}")
+        self.on_update(entry)
 
-        if source_info["new_phrase"] or len(transcript) == 0:
-            if len(transcript) > MAX_PHRASES:
-                transcript.pop(-1)
-            transcript.insert(0, (f"{who_spoke}: [{text}]\n\n", time_spoken))
-        else:
-            transcript[0] = (f"{who_spoke}: [{text}]\n\n", time_spoken)
+    def _trim(self):
+        if len(self._entries) <= MAX_PHRASES:
+            return
+        ordered = sorted(self._entries.values(), key=lambda e: e.start_time)
+        for old in ordered[: len(ordered) - MAX_PHRASES]:
+            self._entries.pop(old.phrase_id, None)
+            self._latest_seq.pop(old.phrase_id, None)
+            self._final_seen.discard(old.phrase_id)
 
-    def get_transcript(self):
-        combined_transcript = list(merge(
-            self.transcript_data["You"], self.transcript_data["Speaker"], 
-            key=lambda x: x[1], reverse=True))
-        combined_transcript = combined_transcript[:MAX_PHRASES]
-        return "".join([t[0] for t in combined_transcript])
-    
+    def _bump(self):
+        self.version += 1
+        self.transcript_changed_event.set()
+
+    # -- output ------------------------------------------------------------------
+    def get_entries(self, final_only: bool = False, who: Optional[str] = None) -> List[TranscriptEntry]:
+        with self._lock:
+            items = list(self._entries.values())
+        if final_only:
+            items = [e for e in items if e.is_final]
+        if who:
+            items = [e for e in items if e.who == who]
+        items.sort(key=lambda e: e.start_time)
+        return items
+
+    def get_transcript(self, newest_first: bool = True, limit: int = 12) -> str:
+        items = self.get_entries()
+        if newest_first:
+            items = list(reversed(items))
+        return "".join(e.line() for e in items[:limit])
+
+    def recent_phrases(self, who: str = "Speaker", seconds: float = 20.0, now: Optional[float] = None,
+                       include_interim: bool = True) -> List[Tuple[int, str, float]]:
+        now = time.time() if now is None else now
+        out = []
+        for e in self.get_entries(who=who):
+            if not include_interim and not e.is_final:
+                continue
+            if now - e.end_time <= seconds:
+                out.append((e.phrase_id, e.text, e.end_time))
+        return out
+
+    def average_latency_ms(self) -> float:
+        with self._lock:
+            n = self.stats["decoded"]
+            return self.stats["total_latency_ms"] / n if n else 0.0
+
     def clear_transcript_data(self):
-        self.transcript_data["You"].clear()
-        self.transcript_data["Speaker"].clear()
-
-        self.audio_sources["You"]["last_sample"] = bytes()
-        self.audio_sources["Speaker"]["last_sample"] = bytes()
-
-        self.audio_sources["You"]["new_phrase"] = True
-        self.audio_sources["Speaker"]["new_phrase"] = True
+        with self._lock:
+            self._entries.clear()
+            self._latest_seq.clear()
+            self._final_seen.clear()
+            # drop queued work
+            try:
+                while True:
+                    self._jobs.get_nowait()
+            except queue.Empty:
+                pass
+            self._bump()

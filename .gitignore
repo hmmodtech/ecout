@@ -1,0 +1,22 @@
+# private material – never commit
+context/*
+!context/README.md
+recordings/
+keys.py
+.env
+config.local.json
+
+# python
+__pycache__/
+*.pyc
+venv/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# generated
+*.wav
+*.mp3
+*.log
+.qa_embeddings_*.json

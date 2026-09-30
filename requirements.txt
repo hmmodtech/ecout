@@ -1,11 +1,20 @@
+# --- core ---------------------------------------------------------------
 numpy
-pyaudiowpatch
 customtkinter
-faster-whisper
-openai
-google-generativeai
 keyboard
-pypdf
-python-docx
 requests
-soundfile
+python-docx
+pypdf
+
+# --- audio capture (Windows WASAPI: microphone + speaker loopback) ---------
+pyaudiowpatch
+pycaw            # follows the Windows default device when it changes
+comtypes
+
+# --- speech recognition -----------------------------------------------------
+faster-whisper   # local Whisper (CTranslate2, no ffmpeg needed)
+# openai         # optional: --api mode with OpenAI whisper-1
+
+# --- Gemini (answers / semantic search / optional cloud ASR) ---------------
+google-genai            # current SDK (supports thinking_level → fast answers)
+google-generativeai     # legacy SDK, used only as a fallback if google-genai is missing

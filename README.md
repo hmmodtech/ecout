@@ -1,108 +1,131 @@
+# 🎧 Abujami Assistant (ecout)
 
-# 🎧 Ecoute
+Real-time interview copilot for Windows, based on [SevaSk/ecoute](https://github.com/SevaSk/ecoute).
 
-Ecoute is a live transcription tool that provides real-time transcripts for both the user's microphone input (You) and the user's speakers output (Speaker) in a textbox.
+It listens to **your speakers (the interviewer)** and **your microphone (you)**, transcribes both
+locally with Whisper, detects the interviewer's question the moment it is spoken and shows an answer:
 
-## Sponsored By: Recall.ai - Meeting Transcription API
+1. **📚 QA file first** – your own question/answer bank in `context/`
+2. **🔥 HEAT file second** – your training material (and any other reference docs)
+3. **✨ Gemini last** – only when the files do not contain a confident answer
+   (it is still given your files + CV as context, and streams the reply word by word)
 
-If you’re working with speech detection or transcription for meetings, consider checking out [Recall.ai](https://www.recall.ai/product/meeting-transcription-api/?utm_source=github&utm_medium=sponsorship&utm_campaign=sevask-ecoute), an API that works with Zoom, Google Meet, Microsoft Teams, and more. Recall.ai diarizes by pulling the speaker data and separate audio streams from the meeting platforms, which means 100% accurate speaker diarization with actual speaker names and speaker emails.
+> Arabic summary: see [العربية](#العربية) at the bottom.
 
-## 📖 Demo
+---
 
-https://github.com/user-attachments/assets/5616421f-838d-439f-8b15-0df7b8d33459
+## What changed vs. the original fork
 
-Ecoute is designed to help users in their conversations by providing live transcriptions.
+| Problem | Fix |
+|---|---|
+| Audio stopped when the headset / default device changed | New `audio_engine.py`: polls the Windows default endpoints (pycaw) and **re-opens the streams automatically** on change, stall or error. Manual **Reconnect** button too. |
+| Slow: question caught late, answer arrived late | Local answers come from an in-memory search index (milliseconds). Whisper runs with `beam_size=1`, int8, VAD, a 2-worker queue that prioritises the interviewer's final phrases, plus interim transcripts every 2.5 s. Gemini uses the new `google-genai` SDK with **`thinking_level=minimal`** (3.x Flash models think at *medium* by default – the main source of latency and truncated answers). |
+| Answers came only from the AI prompt | `knowledge_base.py` parses your QA/HEAT files into pairs & passages, `retrieval.py` (BM25 + fuzzy + optional Gemini embeddings) ranks them, `answer_engine.py` enforces **QA → HEAT → Gemini**. |
+| `custom_speech_recognition` used `audioop`/`distutils` (removed in Python 3.12/3.13) | Replaced by direct `pyaudiowpatch` callback streams; **no FFmpeg needed**. |
 
-## 🚀 Getting Started
+## 📋 Prerequisites
 
-Follow these steps to set up and run Ecoute on your local machine.
+* Windows 10/11, Python 3.10 – 3.13
+* A Gemini API key (only for the AI fallback / semantic search)
 
-### 📋 Prerequisites
+## 🔧 Installation
 
-- Python >=3.8.0
-- (Optional) An OpenAI API key that can access Whisper API (set up a paid account OpenAI account)
-- Windows OS (Not tested on others)
-- FFmpeg 
-
-If FFmpeg is not installed in your system, you can follow the steps below to install it.
-
-First, you need to install Chocolatey, a package manager for Windows. Open your PowerShell as Administrator and run the following command:
-```
-Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-```
-Once Chocolatey is installed, you can install FFmpeg by running the following command in your PowerShell:
-```
-choco install ffmpeg
-```
-Please ensure that you run these commands in a PowerShell window with administrator privileges. If you face any issues during the installation, you can visit the official Chocolatey and FFmpeg websites for troubleshooting.
-
-### 🔧 Installation
-
-1. Clone the repository:
-
-   ```
-   git clone https://github.com/SevaSk/ecoute
-   ```
-
-2. Navigate to the `ecoute` folder:
-
-   ```
-   cd ecoute
-   ```
-
-3. Install the required packages:
-
-   ```
-   pip install -r requirements.txt
-   ```
-   
-4. (Optional) Create a `keys.py` file in the ecoute directory and add your OpenAI API key:
-
-   - Option 1: You can utilize a command on your command prompt. Run the following command, ensuring to replace "API KEY" with your actual OpenAI API key:
-
-      ```
-      python -c "with open('keys.py', 'w', encoding='utf-8') as f: f.write('OPENAI_API_KEY=\"API KEY\"')"
-      ```
-
-   - Option 2: You can create the keys.py file manually. Open up your text editor of choice and enter the following content:
-   
-      ```
-      OPENAI_API_KEY="API KEY"
-      ```
-      Replace "API KEY" with your actual OpenAI API key. Save this file as keys.py within the ecoute directory.
-
-### 🎬 Running Ecoute
-
-Run the main script:
-
-```
-python main.py
+```bat
+git clone https://github.com/hmmodtech/ecout
+cd ecout
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
-For a more better and faster version that also works with most languages, use:
+Put your API key in **one** of these (never in git):
 
+* `config.local.json` → `{"gemini_api_key": "AIza..."}` (created automatically when you save it in Settings), or
+* environment variable `GEMINI_API_KEY`, or
+* `keys.py` → `GEMINI_API_KEY = "AIza..."`
+
+## 📁 Your files (`context/`)
+
+Copy your documents into the `context/` folder (`.docx`, `.pdf`, `.txt`, `.md`):
+
+| Content | Name it like… | Bucket |
+|---|---|---|
+| Interview questions & answers | `QA_*.docx`, `Interview Questions.docx`, `Q&A…` | **QA** (searched first) |
+| HEAT / training notes | `HEAT_*.pdf`, `Hostile Environment Training…` | **HEAT** (second) |
+| CV / résumé | `CV_*.pdf`, `Abujami_CV.docx` | CV (context for Gemini) |
+| Job description | `JD_*.docx` | JD |
+| Anything else | `extra_*` or any other name | EXTRA (searched with HEAT) |
+
+The QA parser understands `Q:`/`A:`, `Q1.`/`Answer:`, `Question:`/`Answer:`, `Interviewer:`/`Candidate:`,
+Arabic `س:`/`ج:`, numbered lists, questions followed by a paragraph, tables in Word, etc.
+**Verify what was parsed** (do this once!):
+
+```bat
+python knowledge_base.py context
 ```
-python main.py --api
+
+You can also add files from the app: **Settings → Upload QA / Upload HEAT**.
+
+## ▶ Running
+
+```bat
+python main.py          # or double-click run.bat
+python main.py --api    # use a cloud ASR instead of local Whisper (OpenAI whisper-1 or Gemini)
 ```
 
-Upon initiation, Ecoute will begin transcribing your microphone input and speaker output in real-time. Please note that it might take a few seconds for the system to warm up before the transcription becomes real-time.
+* **Interview mode** – auto-answers every question the *Speaker* asks. `Alt+Q` (configurable) or the
+  **Answer** button forces an answer for the last thing said.
+* **Meeting mode** – records a transcript and exports it to Word.
+* Status bar shows the current mic/speaker device names, ASR latency and knowledge-base counts.
 
-The --api flag will use the whisper api for transcriptions. This significantly enhances transcription speed and accuracy, and it works in most languages (rather than just English without the flag). It's expected to become the default option in future releases. However, keep in mind that using the Whisper API will consume more OpenAI credits than using the local model. This increased cost is attributed to the advanced features and capabilities that the Whisper API provides. Despite the additional expense, the substantial improvements in speed and transcription accuracy may make it a worthwhile investment for your use case.
+## ⚙ Settings worth knowing (`config.json`)
 
-### ⚠️ Limitations
+| Key | Default | Meaning |
+|---|---|---|
+| `auto_answer` | `true` | Answer speaker questions automatically |
+| `qa_high_confidence` / `qa_medium_confidence` | `0.62` / `0.40` | Above *high* → answer straight from the file; between → shown as "closest match" and Gemini is asked; below → Gemini |
+| `semantic_search` | `true` | Also match by meaning using Gemini embeddings (cached in `context/.qa_embeddings_*.json`) |
+| `ai_refine_local_answers` | `false` | Ask Gemini to polish a file answer (slower) |
+| `whisper_model` | `base.en` | `tiny.en` = fastest, `small.en` = more accurate (GPU recommended) |
+| `asr_beam_size` / `asr_workers` | `1` / `2` | Speed knobs for Whisper |
+| `pause_threshold` | `0.5` s | Silence that ends a phrase |
+| `interim_interval` | `2.5` s | How often long phrases produce partial transcripts |
+| `device_role` | `auto` | Which Windows default device to follow: `auto`, `multimedia`, `communications` |
+| `transcribe_mic` | `true` | Turn off to save CPU if you only need the interviewer |
+| `model_name` / `llm_thinking` | `gemini-3.6-flash` / `minimal` | Gemini model and thinking level (`minimal`, `low`, `medium`, `high`, `default`) |
 
-While Ecoute provides real-time transcription and response suggestions, there are several known limitations to its functionality that you should be aware of:
+## 🧪 Tests
 
-**Default Mic and Speaker:** Ecoute is currently configured to listen only to the default microphone and speaker set in your system. It will not detect sound from other devices or systems. If you wish to use a different mic or speaker, you will need to set it as your default device in your system settings.
+```bat
+pip install -r requirements-dev.txt
+pytest tests -q
+```
 
-**Whisper Model**: If the --api flag is not used, we utilize the 'tiny' version of the Whisper ASR model, due to its low resource consumption and fast response times. However, this model may not be as accurate as the larger models in transcribing certain types of speech, including accents or uncommon words.
+The suite (70 tests) covers the parser, retrieval, question detection, the answer pipeline,
+the audio engine (with a fake PyAudio) and the transcriber queue – no audio hardware needed.
 
-**Language**: If you are not using the --api flag the Whisper model used in Ecoute is set to English. As a result, it may not accurately transcribe non-English languages or dialects. We are actively working to add multi-language support to future versions of the program.
+---
 
-## 📖 License
+## العربية
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+**Abujami Assistant** – مساعد مقابلات فوري على ويندوز.
 
-## 🤝 Contributing
+* يسمع صوت **السماعة (المحاور)** و**المايك (أنت)** ويحوّلهما لنص محلياً بـ Whisper.
+* يلتقط السؤال لحظة نطقه ويبحث عن الجواب بهذا الترتيب: **ملف الأسئلة (QA) ← ملف HEAT ← Gemini**.
+* لو تغيّر جهاز الصوت (سماعة/مايك) يعيد الاتصال تلقائياً بالجهاز الافتراضي الحالي، وفيه زر **Reconnect** يدوي.
 
-Contributions are welcome! Feel free to open issues or submit pull requests to improve Ecoute.
+### التشغيل
+1. `pip install -r requirements.txt`
+2. ضع ملفاتك في مجلد `context/`:
+   * ملف الأسئلة: اسمه يحتوي `QA` أو `Questions` أو `Interview` (مثل `QA_Interview.docx`)
+   * ملف التدريب: اسمه يحتوي `HEAT` أو `Training`
+   * السيرة الذاتية: `CV_*.pdf`
+3. تأكد من قراءة الملفات: `python knowledge_base.py context`
+4. ضع مفتاح Gemini في `config.local.json` أو متغير البيئة `GEMINI_API_KEY` (لا تضعه في `config.json`).
+5. `python main.py`
+
+### إعدادات مهمة
+* `auto_answer`: الرد التلقائي على أسئلة المحاور.
+* `whisper_model`: ‏`tiny.en` أسرع، `base.en` متوازن، `small.en` أدق.
+* `device_role`: ‏`auto` يتابع جهاز الاتصالات الافتراضي في ويندوز (المناسب لـ Teams/Zoom).
+* `llm_thinking`: ‏`minimal` لأسرع رد من Gemini.
