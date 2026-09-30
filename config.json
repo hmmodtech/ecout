@@ -1,0 +1,13 @@
+{
+    "gemini_api_key": "AQ.Ab8RN6I5LBydn2bzA6pcUEkCvSeqtYr6aKoAjiO4tzho9U-jaQ",
+    "model_name": "gemini-3.6-flash",
+    "alpha": 0.75,
+    "stealth_mode": true,
+    "auto_answer": false,
+    "show_visualizer": true,
+    "auto_save_recording": true,
+    "hotkey": "alt+q",
+    "max_tokens": 300,
+    "temperature": 0.4,
+    "language_mode": "English Only"
+}

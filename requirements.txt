@@ -1,0 +1,11 @@
+numpy
+pyaudiowpatch
+customtkinter
+faster-whisper
+openai
+google-generativeai
+keyboard
+pypdf
+python-docx
+requests
+soundfile
